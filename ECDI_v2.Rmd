@@ -1,0 +1,1030 @@
+---
+title: "Predictors of Early Childhood Development in Nigeria Using Random Forest Models"
+author: "Joshua W. Edefo"
+date: "October 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+license: "GPL-3.0"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 6, dpi = 300
+)
+options(width = 200)
+set.seed(123)
+```
+
+# Introduction
+
+This analysis uses Random Forest classification to examine characteristics associated with early childhood development among children aged 24 to 59 months in Nigeria. The binary outcome is the ECDI2030 classification of children as developmentally on track or not on track. Model performance is assessed using cluster aware training and test partitions, cross validation, discrimination and classification metrics. Permutation importance and partial dependence plots are used to explore the contribution of selected predictors.
+
+# 1. Load packages and import data
+
+```{r packages}
+required_packages <- c(
+  "haven", "data.table", "caret", "ranger", "ggplot2",
+  "pROC", "pdp", "dplyr", "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these packages before running the analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(haven)
+library(data.table)
+library(caret)
+library(ranger)
+library(ggplot2)
+library(pROC)
+library(pdp)
+library(dplyr)
+library(knitr)
+```
+
+```{r import-data}
+project_dir <- "C:/Users/edefoj/Documents/Per/MICS/Nigeria _2021"
+input_file <- file.path(project_dir, "children_pro.dta")
+output_dir <- file.path(project_dir, "RF_results")
+
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Retain Stata value labels so figures can use descriptive categories.
+data <- as.data.table(haven::read_dta(input_file))
+
+cat("Initial number of observations:", nrow(data), "\n")
+cat("Initial number of variables:", ncol(data), "\n")
+```
+
+# 2. Select variables and check the outcome
+
+The ECDI2030 outcome must have been derived using the official scoring criteria before modelling. In particular, verify the scoring of all 20 items, including EC39 and EC40, and the handling of missing and skipped responses.
+
+```{r select-variables}
+outcome_var <- "agegrp1_cat"
+
+predictors <- c(
+  "HL4", "HH6", "zone", "windex5MICS",
+  "cdisability", "melevel_comb", "EC1",
+  "ethnicity", "UCD2G", "UCD2K", "UCF18", "CA1"
+)
+
+metadata_vars <- c("UF1", "stratum", "chweightMICS")
+required_vars <- c(outcome_var, predictors)
+missing_vars <- setdiff(required_vars, names(data))
+
+if (length(missing_vars) > 0) {
+  stop("Required variables missing: ", paste(missing_vars, collapse = ", "))
+}
+
+available_metadata <- intersect(metadata_vars, names(data))
+data <- data[, c(required_vars, available_metadata), with = FALSE]
+
+# Assumption: 1 = developmentally on track; 0 = not on track.
+outcome_code <- as.character(haven::zap_labels(data[[outcome_var]]))
+
+invalid_outcome <- !is.na(outcome_code) &
+  !outcome_code %in% c("0", "1")
+
+if (any(invalid_outcome)) {
+  stop("Outcome contains values other than 0, 1 or missing.")
+}
+
+data[, (outcome_var) := factor(
+  outcome_code,
+  levels = c("1", "0"),
+  labels = c("On_track", "Not_on_track")
+)]
+
+data <- data[!is.na(get(outcome_var))]
+
+if (length(unique(na.omit(data[[outcome_var]]))) != 2) {
+  stop("Both outcome classes must be present.")
+}
+
+outcome_distribution <- as.data.frame(
+  prop.table(table(data[[outcome_var]]))
+)
+
+names(outcome_distribution) <- c("Outcome_code", "Proportion")
+outcome_distribution$Outcome <- factor(
+  outcome_distribution$Outcome_code,
+  levels = c("On_track", "Not_on_track"),
+  labels = c("On track", "Not on track")
+)
+outcome_distribution$Percentage <- 100 * outcome_distribution$Proportion
+
+knitr::kable(
+  outcome_distribution[, c("Outcome", "Proportion", "Percentage")],
+  digits = 2,
+  caption = "Distribution of ECDI2030 developmental status"
+)
+
+write.csv(
+  outcome_distribution,
+  file.path(output_dir, "outcome_distribution.csv"),
+  row.names = FALSE
+)
+
+cat("Observations with a valid outcome:", nrow(data), "\n")
+```
+
+# 3. Check missingness and prepare predictors
+
+Missing categorical predictor values are represented as an explicit `Unknown` category. This avoids automatically excluding children with missing predictor information, but it does not replace an assessment of why data are missing.
+
+```{r missingness}
+missing_summary <- data.table(
+  Variable = names(data),
+  Missing_n = vapply(data, function(x) sum(is.na(x)), numeric(1)),
+  Missing_percent = vapply(data, function(x) 100 * mean(is.na(x)), numeric(1))
+)
+
+missing_summary <- missing_summary[order(-Missing_percent)]
+
+knitr::kable(
+  missing_summary,
+  digits = 2,
+  caption = "Missing data before predictor recoding"
+)
+
+write.csv(
+  missing_summary,
+  file.path(output_dir, "missingness_summary.csv"),
+  row.names = FALSE
+)
+```
+
+```{r factor-preparation}
+# Readable labels are obtained from the Stata value labels where available.
+# All predictors are treated as categorical for this primary analysis.
+for (v in predictors) {
+  x <- haven::as_factor(data[[v]], levels = "default")
+  x <- as.character(x)
+  x[is.na(x) | trimws(x) == ""] <- "Unknown"
+
+  # Factor levels are established before splitting and retained afterwards.
+  data[, (v) := factor(x)]
+}
+
+constant_vars <- predictors[
+  vapply(
+    data[, ..predictors],
+    function(x) length(unique(x)) < 2,
+    logical(1)
+  )
+]
+
+if (length(constant_vars) > 0) {
+  warning("Removing constant predictors: ", paste(constant_vars, collapse = ", "))
+  predictors <- setdiff(predictors, constant_vars)
+}
+
+if (length(predictors) == 0) {
+  stop("No usable predictors remain.")
+}
+
+cat("Predictors included in the primary model:\n")
+print(predictors)
+```
+
+# 4. Define publication friendly labels
+
+These labels correspond to the terminology in the regression table. Category labels will use the Stata value labels where these are available.
+
+```{r figure-labels}
+variable_labels <- c(
+  HL4 = "Child sex",
+  HH6 = "Place of residence",
+  zone = "Geopolitical zone",
+  windex5MICS = "Household wealth index",
+  cdisability = "Child functional difficulty",
+  melevel_comb = "Mother's education",
+  EC1 = "Number of children's books",
+  ethnicity = "Ethnic group",
+  UCD2G = "Hit child with belt, brush or stick",
+  UCD2K = "Beat child as hard as possible",
+  UCF18 = "Child has difficulty playing",
+  CA1 = "Diarrhoea in the previous two weeks"
+)
+
+pretty_variable <- function(x) {
+  result <- unname(variable_labels[x])
+  missing_label <- is.na(result)
+  result[missing_label] <- x[missing_label]
+  result
+}
+
+status_labels <- c(
+  On_track = "On track",
+  Not_on_track = "Not on track"
+)
+
+pretty_status <- function(x) {
+  unname(status_labels[as.character(x)])
+}
+```
+
+# 5. Explore the outcome and predictors
+
+```{r outcome-plot}
+outcome_plot_data <- data.frame(
+  Outcome = factor(
+    data[[outcome_var]],
+    levels = c("On_track", "Not_on_track"),
+    labels = c("On track", "Not on track")
+  )
+)
+
+p_outcome <- ggplot(outcome_plot_data, aes(x = Outcome)) +
+  geom_bar(fill = "#2C7FB8", colour = "white", width = 0.7) +
+  labs(
+    title = "Distribution of early childhood development status",
+    x = "ECDI2030 classification",
+    y = "Number of children"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.text = element_text(colour = "black")
+  )
+
+print(p_outcome)
+
+ggsave(
+  file.path(output_dir, "outcome_distribution.png"),
+  p_outcome, width = 8, height = 5, dpi = 300, bg = "white"
+)
+```
+
+```{r predictor-plots}
+for (v in intersect(
+  c("ethnicity", "windex5MICS", "melevel_comb", "EC1"),
+  predictors
+)) {
+  p <- ggplot(data, aes(x = .data[[v]])) +
+    geom_bar(fill = "#2C7FB8", colour = "white", width = 0.75) +
+    labs(
+      title = paste("Distribution of", pretty_variable(v)),
+      x = pretty_variable(v),
+      y = "Number of children"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 14),
+      axis.text.x = element_text(
+        angle = 35, hjust = 1, colour = "black"
+      ),
+      axis.text.y = element_text(colour = "black")
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(output_dir, paste0("distribution_", v, ".png")),
+    p, width = 9, height = 5.5, dpi = 300, bg = "white"
+  )
+}
+```
+
+# 6. Check associations between categorical predictors
+
+These checks identify strong associations between predictors. Strongly associated variables may share information, affecting the stability and interpretation of feature importance.
+
+```{r association-checks}
+if (requireNamespace("DescTools", quietly = TRUE)) {
+
+  factor_vars <- predictors[
+    vapply(data[, ..predictors], is.factor, logical(1))
+  ]
+
+  cramer_matrix <- matrix(
+    NA_real_,
+    nrow = length(factor_vars),
+    ncol = length(factor_vars),
+    dimnames = list(factor_vars, factor_vars)
+  )
+
+  for (i in seq_along(factor_vars)) {
+    for (j in seq_along(factor_vars)) {
+      cramer_matrix[i, j] <- suppressWarnings(
+        DescTools::CramerV(
+          table(data[[factor_vars[i]]], data[[factor_vars[j]]]),
+          bias.correct = TRUE
+        )
+      )
+    }
+  }
+
+  print(round(cramer_matrix, 3))
+
+  write.csv(
+    cramer_matrix,
+    file.path(output_dir, "cramers_v_predictors.csv")
+  )
+
+} else {
+  message("Install DescTools to calculate Cramer's V.")
+}
+```
+
+# 7. Create training and test datasets
+
+Where cluster identifiers are available, entire clusters are assigned to either the training or test dataset. This reduces the risk of children from the same primary sampling unit appearing in both datasets.
+
+```{r train-test-split}
+set.seed(123)
+
+has_clusters <- "UF1" %in% names(data) && !all(is.na(data$UF1))
+
+if (has_clusters) {
+
+  cluster_id <- as.character(haven::zap_labels(data$UF1))
+  missing_cluster <- is.na(cluster_id) | trimws(cluster_id) == ""
+
+  if (any(missing_cluster)) {
+    cluster_id[missing_cluster] <- paste0(
+      "missing_cluster_", which(missing_cluster)
+    )
+    warning(
+      "Some cluster identifiers are missing. Each affected observation ",
+      "has been treated as a separate cluster."
+    )
+  }
+
+  cluster_ids <- unique(cluster_id)
+
+  if (length(cluster_ids) < 10) {
+    stop("Too few clusters for the planned cluster-aware validation.")
+  }
+
+  split_found <- FALSE
+
+  for (attempt in seq_len(500)) {
+
+    test_clusters <- sample(
+      cluster_ids,
+      size = max(1, ceiling(0.20 * length(cluster_ids)))
+    )
+
+    test_index <- which(cluster_id %in% test_clusters)
+    train_index <- setdiff(seq_len(nrow(data)), test_index)
+
+    if (
+      length(unique(data[[outcome_var]][train_index])) == 2 &&
+      length(unique(data[[outcome_var]][test_index])) == 2
+    ) {
+      split_found <- TRUE
+      break
+    }
+  }
+
+  if (!split_found) {
+    stop(
+      "Could not obtain a cluster-based split containing both outcome classes. ",
+      "Review the number of clusters and outcome distribution."
+    )
+  }
+
+} else {
+
+  warning(
+    "UF1 is unavailable. Using a stratified row-level split, which ",
+    "does not prevent children from the same cluster appearing in both datasets."
+  )
+
+  test_index <- as.vector(
+    caret::createDataPartition(
+      data[[outcome_var]],
+      p = 0.20,
+      list = FALSE
+    )
+  )
+
+  train_index <- setdiff(seq_len(nrow(data)), test_index)
+}
+
+model_vars <- c(outcome_var, predictors)
+
+train_data <- as.data.frame(data[train_index, ..model_vars])
+test_data <- as.data.frame(data[test_index, ..model_vars])
+
+# Do not drop unused factor levels. This retains the same category schema
+# across training and test data, including the Unknown category when present.
+for (v in predictors) {
+  train_levels <- levels(data[[v]])
+  train_data[[v]] <- factor(
+    as.character(train_data[[v]]),
+    levels = train_levels
+  )
+  test_data[[v]] <- factor(
+    as.character(test_data[[v]]),
+    levels = train_levels
+  )
+}
+
+cat("Training observations:", nrow(train_data), "\n")
+cat("Test observations:", nrow(test_data), "\n")
+
+if (has_clusters) {
+  cat("Training clusters:", length(unique(cluster_id[train_index])), "\n")
+  cat("Test clusters:", length(unique(cluster_id[test_index])), "\n")
+  stopifnot(
+    length(intersect(
+      unique(cluster_id[train_index]),
+      unique(cluster_id[test_index])
+    )) == 0
+  )
+}
+
+print(table(train_data[[outcome_var]]))
+print(table(test_data[[outcome_var]]))
+```
+
+# 8. Create cluster grouped cross validation folds
+
+```{r grouped-cross-validation}
+set.seed(123)
+
+K <- 10
+
+if (has_clusters) {
+
+  training_clusters <- cluster_id[train_index]
+  unique_training_clusters <- unique(training_clusters)
+
+  if (length(unique_training_clusters) < 3) {
+    stop("At least three training clusters are required for grouped CV.")
+  }
+
+  K <- min(K, length(unique_training_clusters))
+
+  if (K < 3) {
+    stop("At least three folds are required.")
+  }
+
+  folds_found <- FALSE
+
+  for (attempt in seq_len(500)) {
+
+    cluster_fold <- sample(
+      rep(seq_len(K), length.out = length(unique_training_clusters))
+    )
+    names(cluster_fold) <- unique_training_clusters
+
+    fold_id <- unname(cluster_fold[training_clusters])
+
+    index_out <- lapply(seq_len(K), function(k) {
+      which(fold_id == k)
+    })
+
+    index <- lapply(index_out, function(out_rows) {
+      setdiff(seq_len(nrow(train_data)), out_rows)
+    })
+
+    valid_folds <- vapply(seq_len(K), function(k) {
+      length(unique(train_data[[outcome_var]][index_out[[k]]])) == 2 &&
+        length(unique(train_data[[outcome_var]][index[[k]]])) == 2
+    }, logical(1))
+
+    if (all(valid_folds)) {
+      folds_found <- TRUE
+      break
+    }
+  }
+
+  if (!folds_found) {
+    stop(
+      "Could not create grouped folds with both outcome classes in every fold. ",
+      "Consider fewer folds or review cluster and outcome distributions."
+    )
+  }
+
+} else {
+
+  warning("Using ordinary stratified cross validation because UF1 is unavailable.")
+
+  index_out <- caret::createFolds(
+    train_data[[outcome_var]],
+    k = K,
+    returnTrain = FALSE
+  )
+
+  index <- lapply(index_out, function(out_rows) {
+    setdiff(seq_len(nrow(train_data)), out_rows)
+  })
+}
+
+tc <- caret::trainControl(
+  method = "cv",
+  number = K,
+  index = index,
+  indexOut = index_out,
+  classProbs = TRUE,
+  summaryFunction = caret::twoClassSummary,
+  savePredictions = "final",
+  allowParallel = FALSE
+)
+```
+
+# 9. Calculate class weights
+
+Class weights are estimated from the training data only. These weights address outcome imbalance and are not the same as the MICS sampling weights.
+
+```{r class-weights}
+class_counts <- table(train_data[[outcome_var]])
+
+if (any(class_counts == 0)) {
+  stop("Both outcome classes must occur in the training data.")
+}
+
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+
+observation_weights <- unname(
+  class_weights[as.character(train_data[[outcome_var]])]
+)
+
+cat("Class weights:\n")
+print(class_weights)
+
+write.csv(
+  data.frame(
+    Outcome = names(class_counts),
+    Count = as.integer(class_counts),
+    Class_weight = as.numeric(class_weights[names(class_counts)])
+  ),
+  file.path(output_dir, "class_weights.csv"),
+  row.names = FALSE
+)
+```
+
+# 10. Train and tune Random Forest models
+
+Models are selected using cross validated ROC AUC rather than accuracy alone.
+
+```{r train-models}
+set.seed(123)
+
+p <- length(predictors)
+
+mtry_values <- unique(pmax(
+  1,
+  pmin(p, c(floor(sqrt(p)), floor(p / 3), floor(p / 2)))
+))
+
+tuned_grid <- unique(expand.grid(
+  mtry = mtry_values,
+  splitrule = "gini",
+  min.node.size = c(5, 10, 20)
+))
+
+default_grid <- data.frame(
+  mtry = max(1, min(p, floor(sqrt(p)))),
+  splitrule = "gini",
+  min.node.size = 5
+)
+
+default_model <- caret::train(
+  On_track ~ .,
+  data = data.frame(
+    On_track = train_data[[outcome_var]],
+    train_data[, predictors, drop = FALSE]
+  ),
+  method = "ranger",
+  trControl = tc,
+  tuneGrid = default_grid,
+  metric = "ROC",
+  weights = observation_weights,
+  num.trees = 1000,
+  importance = "permutation",
+  respect.unordered.factors = "order"
+)
+
+tuned_model <- caret::train(
+  On_track ~ .,
+  data = data.frame(
+    On_track = train_data[[outcome_var]],
+    train_data[, predictors, drop = FALSE]
+  ),
+  method = "ranger",
+  trControl = tc,
+  tuneGrid = tuned_grid,
+  metric = "ROC",
+  weights = observation_weights,
+  num.trees = 1000,
+  importance = "permutation",
+  respect.unordered.factors = "order"
+)
+
+cat("Default model cross validated performance:\n")
+print(default_model$results)
+
+cat("Tuned model cross validated performance:\n")
+print(tuned_model$results)
+
+if (max(tuned_model$results$ROC, na.rm = TRUE) >
+    max(default_model$results$ROC, na.rm = TRUE)) {
+  best_model <- tuned_model
+  selected_model <- "Tuned Random Forest"
+} else {
+  best_model <- default_model
+  selected_model <- "Default Random Forest"
+}
+
+cat("Selected model:", selected_model, "\n")
+print(best_model$bestTune)
+
+saveRDS(best_model, file.path(output_dir, "best_random_forest_model.rds"))
+
+write.csv(
+  tuned_model$results,
+  file.path(output_dir, "tuned_model_cross_validation.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  default_model$results,
+  file.path(output_dir, "default_model_cross_validation.csv"),
+  row.names = FALSE
+)
+```
+
+# 11. Evaluate performance in the held out test dataset
+
+The test set is not used for model selection. Internal class names use underscores for reliable model fitting; figures use human readable labels.
+
+```{r test-performance}
+test_model_data <- data.frame(
+  train_data = NULL
+)
+
+test_model_data <- test_data[, predictors, drop = FALSE]
+
+test_pred <- predict(best_model, newdata = test_model_data)
+
+test_prob <- predict(
+  best_model,
+  newdata = test_model_data,
+  type = "prob"
+)[, "On_track"]
+
+conf_matrix <- caret::confusionMatrix(
+  data = test_pred,
+  reference = test_data[[outcome_var]],
+  positive = "On_track",
+  mode = "everything"
+)
+
+print(conf_matrix)
+
+test_roc <- pROC::roc(
+  response = test_data[[outcome_var]],
+  predictor = test_prob,
+  levels = c("Not_on_track", "On_track"),
+  direction = "<",
+  quiet = TRUE
+)
+
+test_auc <- as.numeric(pROC::auc(test_roc))
+
+test_metrics <- data.frame(
+  Metric = c(
+    "Accuracy", "Sensitivity", "Specificity",
+    "Balanced accuracy", "Precision", "F1 score", "ROC AUC"
+  ),
+  Value = c(
+    unname(conf_matrix$overall["Accuracy"]),
+    unname(conf_matrix$byClass["Sensitivity"]),
+    unname(conf_matrix$byClass["Specificity"]),
+    unname(conf_matrix$byClass["Balanced Accuracy"]),
+    unname(conf_matrix$byClass["Pos Pred Value"]),
+    unname(conf_matrix$byClass["F1"]),
+    test_auc
+  )
+)
+
+print(test_metrics)
+
+write.csv(
+  test_metrics,
+  file.path(output_dir, "test_performance_metrics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame.matrix(conf_matrix$table),
+  file.path(output_dir, "test_confusion_matrix.csv")
+)
+```
+
+# 12. ROC curve
+
+```{r roc-curve}
+roc_plot <- ggroc(test_roc, legacy.axes = TRUE, linewidth = 1.1) +
+  geom_abline(
+    intercept = 0, slope = 1,
+    linetype = "dashed", colour = "grey55"
+  ) +
+  labs(
+    title = "Discrimination of the Random Forest model",
+    subtitle = paste0(
+      "Held out test set; ROC AUC = ", round(test_auc, 3)
+    ),
+    x = "1 − Specificity",
+    y = "Sensitivity"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.text = element_text(colour = "black")
+  )
+
+print(roc_plot)
+
+ggsave(
+  file.path(output_dir, "test_roc_curve.png"),
+  roc_plot, width = 7, height = 6, dpi = 300, bg = "white"
+)
+```
+
+# 13. Confusion matrix with contrasting colours
+
+The confusion matrix uses observed classifications on the vertical axis and predicted classifications on the horizontal axis. Correct classifications lie on the diagonal. Counts are displayed directly in each cell.
+
+```{r confusion-matrix-plot}
+# caret stores predictions in rows and reference/observed classes in columns.
+# Transpose the table to place observed status on the vertical axis.
+cm_plot_data <- as.data.frame(as.table(t(conf_matrix$table)))
+names(cm_plot_data) <- c("Observed", "Predicted", "Frequency")
+
+status_levels <- c("Not_on_track", "On_track")
+
+cm_plot_data$Observed <- factor(
+  cm_plot_data$Observed,
+  levels = status_levels,
+  labels = c("Not on track", "On track")
+)
+
+cm_plot_data$Predicted <- factor(
+  cm_plot_data$Predicted,
+  levels = status_levels,
+  labels = c("Not on track", "On track")
+)
+
+max_frequency <- max(cm_plot_data$Frequency, na.rm = TRUE)
+
+cm_plot <- ggplot(
+  cm_plot_data,
+  aes(x = Predicted, y = Observed, fill = Frequency)
+) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(
+    aes(
+      label = format(Frequency, big.mark = ","),
+      colour = Frequency > max_frequency * 0.55
+    ),
+    size = 6
+  ) +
+  scale_fill_gradient(
+    low = "#EFF3F8",
+    high = "#174A7E",
+    name = "Number of\nchildren"
+  ) +
+  scale_colour_manual(
+    values = c("FALSE" = "#172B3A", "TRUE" = "white"),
+    guide = "none"
+  ) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_discrete(drop = FALSE) +
+  coord_equal() +
+  labs(
+    title = "Random Forest classification performance",
+    subtitle = "Held out test set",
+    x = "Predicted ECDI2030 status",
+    y = "Observed ECDI2030 status",
+    caption = "Correct classifications lie on the diagonal."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 15),
+    plot.subtitle = element_text(size = 12, colour = "grey30"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11, colour = "black"),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+print(cm_plot)
+
+ggsave(
+  file.path(output_dir, "test_confusion_matrix.png"),
+  cm_plot, width = 8, height = 6.5, dpi = 300, bg = "white"
+)
+```
+
+# 14. Feature importance
+
+Permutation importance estimates how much predictive performance deteriorates when information in a predictor is disrupted. It represents predictive contribution, not the direction or magnitude of an independent association.
+
+```{r feature-importance}
+importance_values <- best_model$finalModel$variable.importance
+
+if (is.null(importance_values) || length(importance_values) == 0) {
+  stop("Variable importance was not produced by the selected model.")
+}
+
+importance_df <- data.frame(
+  Feature = names(importance_values),
+  Importance = as.numeric(importance_values)
+)
+
+importance_df$Predictor <- vapply(
+  importance_df$Feature,
+  pretty_variable,
+  character(1)
+)
+
+importance_df <- importance_df[
+  order(importance_df$Importance, decreasing = TRUE),
+]
+
+importance_df$Predictor <- factor(
+  importance_df$Predictor,
+  levels = rev(importance_df$Predictor)
+)
+
+importance_plot <- ggplot(
+  importance_df,
+  aes(x = Predictor, y = Importance)
+) +
+  geom_col(fill = "#2C7FB8", width = 0.72) +
+  coord_flip() +
+  labs(
+    title = "Predictors of early childhood development status",
+    subtitle = "Random Forest permutation importance",
+    x = NULL,
+    y = "Permutation importance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 14),
+    axis.text = element_text(colour = "black"),
+    panel.grid.major.y = element_blank()
+  )
+
+print(importance_plot)
+
+ggsave(
+  file.path(output_dir, "permutation_feature_importance.png"),
+  importance_plot, width = 10, height = 7, dpi = 300, bg = "white"
+)
+
+write.csv(
+  importance_df,
+  file.path(output_dir, "permutation_feature_importance.csv"),
+  row.names = FALSE
+)
+```
+
+# 15. Partial dependence plots
+
+Partial dependence plots describe how predicted probabilities vary across predictor categories while averaging over other predictors. They should not be interpreted as causal effects. Correlated predictors may complicate their interpretation.
+
+```{r partial-dependence}
+top_features <- head(
+  names(sort(importance_values, decreasing = TRUE)),
+  min(3, length(importance_values))
+)
+
+pdp_results <- list()
+
+for (v in top_features) {
+
+  if (!v %in% predictors) next
+
+  pd <- tryCatch(
+    pdp::partial(
+      object = best_model$finalModel,
+      pred.var = v,
+      train = train_data[, predictors, drop = FALSE],
+      pred.fun = function(object, newdata) {
+        pred <- predict(object, data = newdata)$predictions
+
+        if (is.matrix(pred) || is.data.frame(pred)) {
+          return(pred[, "On_track"])
+        }
+
+        stop("The fitted model did not return class probabilities.")
+      },
+      plot = FALSE
+    ),
+    error = function(e) {
+      message("Partial dependence failed for ", v, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (is.null(pd)) next
+
+  pdp_results[[v]] <- pd
+
+  pd_plot <- autoplot(pd, rug = FALSE) +
+    labs(
+      title = paste(
+        "Predicted developmental status by",
+        pretty_variable(v)
+      ),
+      x = pretty_variable(v),
+      y = "Predicted probability of being developmentally on track"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 13),
+      axis.text = element_text(colour = "black")
+    )
+
+  print(pd_plot)
+
+  ggsave(
+    file.path(output_dir, paste0("partial_dependence_", v, ".png")),
+    pd_plot, width = 9, height = 5.5, dpi = 300, bg = "white"
+  )
+
+  write.csv(
+    pd,
+    file.path(output_dir, paste0("partial_dependence_", v, ".csv")),
+    row.names = FALSE
+  )
+}
+```
+
+# 16. Save predictions and reproducibility information
+
+```{r save-results}
+prediction_results <- data.frame(
+  Observed = pretty_status(test_data[[outcome_var]]),
+  Predicted = pretty_status(test_pred),
+  Probability_on_track = test_prob
+)
+
+write.csv(
+  prediction_results,
+  file.path(output_dir, "test_predictions.csv"),
+  row.names = FALSE
+)
+
+analysis_record <- list(
+  analysis_date = as.character(Sys.Date()),
+  seed = 123,
+  outcome = outcome_var,
+  outcome_coding = c(
+    "On_track = 1",
+    "Not_on_track = 0"
+  ),
+  predictors = predictors,
+  excluded_predictor = "agegrp",
+  selected_model = selected_model,
+  best_parameters = best_model$bestTune,
+  test_metrics = test_metrics,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(
+  analysis_record,
+  file.path(output_dir, "analysis_record.rds")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(output_dir, "session_info.txt")
+)
+
+cat("\nAnalysis completed.\n")
+cat("Selected model:", selected_model, "\n")
+cat("Test set ROC AUC:", round(test_auc, 3), "\n")
+cat("Results saved to:", normalizePath(output_dir), "\n")
+```
+
+# 17. Interpretation and reporting
+
+The Random Forest analysis identifies predictors that contribute to classification of developmental status and evaluates predictive performance in held out observations. Feature importance indicates predictive contribution, not the direction or magnitude of an independent association. Partial dependence plots provide descriptive summaries of model predictions but do not establish causality.
+
+Because the ECDI2030 outcome uses age specific thresholds, age group is excluded from the primary model to reduce target leakage. Findings should be interpreted alongside the survey weighted logistic regression analysis, which addresses associations using the MICS survey design. Class weights used in this Random Forest model are not equivalent to survey weights and do not produce survey design based population estimates.
+
+Model performance, feature importance and partial dependence estimates should be reported only after confirming the validity of the outcome, examining missingness and verifying that the validation procedure is appropriate for the survey's cluster structure.
